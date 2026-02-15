@@ -506,6 +506,10 @@ export default function App() {
   const currentCode = filesContent[currentFile] || "";
 
   const handleApplyAIChangeToActiveFile = (newCode: string) => {
+    // Keep analysis modes in sync when Vibe Coder applies edits.
+    setAiPanelCode(newCode);
+    pendingAiLineChangesRef.current[currentFile] = 0;
+
     setFilesContent((prev) => {
       if (!currentFile || !Object.prototype.hasOwnProperty.call(prev, currentFile)) {
         return prev;
@@ -544,7 +548,7 @@ export default function App() {
             isDarkMode ? "text-[#cccccc]" : "text-[#1f1f1f]"
           }`}
         >
-            TwinStack
+            Clarus - Let's Build
         </div>
 
         <div className="flex items-center gap-3 pr-2">

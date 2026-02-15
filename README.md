@@ -1,4 +1,4 @@
-# 🛠️ IDE AI Assistant
+# 🛠️ Clarus AI-IDE
 ⚡ Vibe Coding Meets Engineering Rigor
 
 ## 📌 What This Project Is
