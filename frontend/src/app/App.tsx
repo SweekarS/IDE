@@ -210,7 +210,6 @@ export default function App() {
     setFilesTree(prev => toggle(prev));
   };
 
-  // --- Menu Actions ---
 
   const appendTerminalLines = (lines: string[]) => {
     setTerminalLines((prev) => [...prev, ...lines]);

@@ -17,6 +17,14 @@ interface VibeResponse {
   updatedContent?: string;
 }
 
+interface OpenAIChatCompletionResponse {
+  choices?: Array<{
+    message?: {
+      content?: string;
+    };
+  }>;
+}
+
 export function AIPanel({ code, fileName, selectedCode, onApplyActiveFileChange }: AIPanelProps) {
   const [explanation, setExplanation] = useState<string>("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -318,27 +326,60 @@ ${snippet}`;
     setStatusMessage("Generating edits...");
 
     try {
-      const model = getModel();
+      const apiKey = import.meta.env.VITE_OPENAI_API_KEY;
+      if (!apiKey) {
+        throw new Error("Missing VITE_OPENAI_API_KEY in environment.");
+      }
+      const model = import.meta.env.VITE_OPENAI_MODEL || "gpt-4o-mini";
       const prompt = `You are a coding agent inside an IDE.
-Complete the user's request by editing only the active file.
-Return only strict JSON with this shape:
-{
-  "summary": "short summary",
-  "updatedContent": "full updated file content"
-}
+        Complete the user's request by editing only the active file.
+        Return only strict JSON with this shape:
+        {
+        "summary": "short summary",
+        "updatedContent": "full updated file content"
+        }
 
-User request:
-${taskPrompt}
+        User request:
+        ${taskPrompt}
 
-Active file:
-${fileName}
+        Active file:
+        ${fileName}
 
-Current content:
-${code}`;
+        Current content:
+        ${code}`;
 
-      const result = await model.generateContent(prompt);
-      const response = await result.response;
-      const raw = response.text();
+      const completionResponse = await fetch(import.meta.env.VITE_OPENAI_API_BASE_URL + 'chat/completions', {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          model,
+          temperature: 0.2,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a precise coding agent. Return only strict JSON with keys summary and updatedContent.",
+            },
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+        }),
+      });
+
+      if (!completionResponse.ok) {
+        throw new Error(`OpenAI request failed with status ${completionResponse.status}`);
+      }
+
+      const completionJson = (await completionResponse.json()) as OpenAIChatCompletionResponse;
+      const raw = completionJson.choices?.[0]?.message?.content;
+      if (typeof raw !== "string" || !raw.trim()) {
+        throw new Error("OpenAI returned an empty response.");
+      }
       const cleaned = raw.replace(/```json\s*/g, "").replace(/```/g, "").trim();
 
       const parsed = JSON.parse(cleaned) as VibeResponse;
@@ -354,8 +395,8 @@ ${code}`;
           : `Applied update to ${fileName}.`
       );
     } catch (error) {
-      if (error instanceof Error && error.message.includes("VITE_GEMINI_API_KEY")) {
-        setStatusMessage("Set VITE_GEMINI_API_KEY to use Vibe Coder.");
+      if (error instanceof Error && error.message.includes("VITE_OPENAI_API_KEY")) {
+        setStatusMessage("Set VITE_OPENAI_API_KEY to use Vibe Coder.");
       } else {
         setStatusMessage("Failed to apply edits. Try refining the prompt.");
       }
