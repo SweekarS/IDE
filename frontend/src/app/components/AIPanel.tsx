@@ -1,6 +1,8 @@
-import React, { useEffect, useRef, useState } from "react";
-import { Bot, Loader2, Sparkles, CheckCircle2, Wand2, WandSparkles } from "lucide-react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import { Bot, Loader2, Sparkles, CheckCircle2, Wand2, WandSparkles, Mic, MicOff, Square } from "lucide-react";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import { useSpeechRecognition } from "../hooks/UseSpeechRecognition";
+import { useTextToSpeech } from "../hooks/UseTextToSpeech";
 
 interface AIPanelProps {
   ideMode?: "dark" | "light";
@@ -10,7 +12,7 @@ interface AIPanelProps {
   onApplyActiveFileChange: (newCode: string) => void;
 }
 
-type AIPanelMode = "reviewer" | "teacher" | "vibe";
+type AIPanelMode = "reviewer" | "teacher" | "vibe" | "voice";
 type PythonFunctionBlock = { functionName: string; source: string };
 
 interface VibeResponse {
@@ -26,6 +28,15 @@ interface OpenAIChatCompletionResponse {
   }>;
 }
 
+type RubberDuckyStatus = "idle" | "listening" | "processing" | "speaking";
+
+interface ConversationMessage {
+  role: "user" | "model";
+  content: string;
+}
+
+const RUBBER_DUCKY_EXIT_PHRASES = ["stop", "done", "end session", "that's all", "we're done"];
+
 export function AIPanel({ ideMode = "dark", code, fileName, selectedCode, onApplyActiveFileChange }: AIPanelProps) {
   const [explanation, setExplanation] = useState<string>("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -33,8 +44,17 @@ export function AIPanel({ ideMode = "dark", code, fileName, selectedCode, onAppl
   const [vibePrompt, setVibePrompt] = useState("");
   const [lastGeminiResponse, setLastGeminiResponse] = useState("");
   const [statusMessage, setStatusMessage] = useState<string>("Ready");
-  const analysisRunRef = useRef(0);
+  const [voiceTranscript, setVoiceTranscript] = useState("");
   const isDarkMode = ideMode === "dark";
+  const analysisRunRef = useRef(0);
+  const { isListening, transcript, supported: speechSupported, start, stop } = useSpeechRecognition();
+  const { speak, isSpeaking, supported: ttsSupported } = useTextToSpeech();
+
+  const [sessionActive, setSessionActive] = useState(false);
+  const [conversationHistory, setConversationHistory] = useState<ConversationMessage[]>([]);
+  const [rubberDuckyStatus, setRubberDuckyStatus] = useState<RubberDuckyStatus>("idle");
+  const rubberDuckyContextRef = useRef<{ fileName: string; code: string } | null>(null);
+  const pendingTranscriptProcessRef = useRef(false);
 
   const normalizeIndent = (line: string) =>
     line.replace(/\t/g, "    ").match(/^\s*/)?.[0].length || 0;
@@ -48,6 +68,102 @@ export function AIPanel({ ideMode = "dark", code, fileName, selectedCode, onAppl
     const genAI = new GoogleGenerativeAI(apiKey);
     return genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
   };
+
+  const getRubberDuckySystemInstruction = useCallback(
+    (file: string, codeContent: string) => {
+      const codeSnippet = codeContent.trim()
+        ? `\n\nHere is the developer's code from file "${file}":\n\`\`\`\n${codeContent}\n\`\`\``
+        : "";
+      return `You are a rubber duck for rubber duck debugging. The developer is explaining their code/problem to you.
+Your job is to help them think through the solution by asking guiding questions-never give direct answers or write code.
+Ask one or two short, thought-provoking questions at a time. Be conversational and encouraging.
+Keep responses brief (1-3 sentences) so they can be spoken naturally.${codeSnippet}`;
+    },
+    []
+  );
+
+  const startRubberDuckySession = useCallback(() => {
+    const codeContext = selectedCode.trim() ? selectedCode : code;
+    rubberDuckyContextRef.current = { fileName, code: codeContext };
+    setSessionActive(true);
+    setConversationHistory([]);
+    setRubberDuckyStatus("idle");
+    setVoiceTranscript("");
+  }, [fileName, code, selectedCode]);
+
+  const endRubberDuckySession = useCallback(() => {
+    setSessionActive(false);
+    setConversationHistory([]);
+    setRubberDuckyStatus("idle");
+    setVoiceTranscript("");
+    rubberDuckyContextRef.current = null;
+    pendingTranscriptProcessRef.current = false;
+  }, []);
+
+  const processRubberDuckyTranscript = useCallback(
+    async (userText: string) => {
+      const trimmed = userText.trim();
+      if (!trimmed) return;
+
+      const shouldExit = RUBBER_DUCKY_EXIT_PHRASES.some((p) =>
+        trimmed.toLowerCase().includes(p)
+      );
+      if (shouldExit) {
+        endRubberDuckySession();
+        return;
+      }
+
+      setConversationHistory((prev) => [...prev, { role: "user", content: trimmed }]);
+      setRubberDuckyStatus("processing");
+
+      try {
+        const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+        if (!apiKey) {
+          setConversationHistory((prev) => [
+            ...prev,
+            { role: "model", content: "Set VITE_GEMINI_API_KEY to use Rubber Ducky." },
+          ]);
+          setRubberDuckyStatus("idle");
+          return;
+        }
+
+        const ctx = rubberDuckyContextRef.current ?? { fileName, code };
+        const systemInstruction = getRubberDuckySystemInstruction(ctx.fileName, ctx.code);
+        const genAI = new GoogleGenerativeAI(apiKey);
+        const model = genAI.getGenerativeModel({
+          model: "gemini-2.5-flash",
+          systemInstruction,
+        });
+
+        const prevHistory = conversationHistory;
+        const geminiHistory = prevHistory.map((m) => ({
+          role: m.role,
+          parts: [{ text: m.content }],
+        }));
+
+        const chat = model.startChat({ history: geminiHistory });
+        const result = await chat.sendMessage(trimmed);
+        const response = result.response;
+        const aiText = response.text()?.trim() ?? "I didn't catch that. Can you say more?";
+
+        setConversationHistory((prev) => [...prev, { role: "model", content: aiText }]);
+        setRubberDuckyStatus("speaking");
+
+        await speak(aiText);
+
+        setRubberDuckyStatus("idle");
+      } catch (err) {
+        const msg =
+          err instanceof Error ? err.message : "Something went wrong. Try again.";
+        setConversationHistory((prev) => [
+          ...prev,
+          { role: "model", content: msg.includes("VITE_GEMINI_API_KEY") ? "Set VITE_GEMINI_API_KEY to use Rubber Ducky." : msg },
+        ]);
+        setRubberDuckyStatus("idle");
+      }
+    },
+    [conversationHistory, endRubberDuckySession, fileName, code, getRubberDuckySystemInstruction, speak]
+  );
   
   const extractPythonFunctions = (codeContent: string): PythonFunctionBlock[] => {
     const lines = codeContent.split("\n");
@@ -170,7 +286,6 @@ ${batchSource}`;
     setIsAnalyzing(true);
     setExplanation("Analyzing selected code in Code Buddy mode...");
     setLastGeminiResponse("");
-
     const genAI = new GoogleGenerativeAI("AIzaSyBLzpDN_C2TsvX70n22V8eqfpLEBXRqZ7Q");
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
@@ -241,7 +356,6 @@ ${snippet}`;
     setIsAnalyzing(true);
     setExplanation("");
     setLastGeminiResponse("");
-
     const extractedFunctions = extractPythonFunctions(codeContent);
     if (extractedFunctions.length === 0) {
       setExplanation("No Python functions found for analysis.");
@@ -299,7 +413,7 @@ ${snippet}`;
   };
 
   useEffect(() => {
-    if (mode === "vibe") {
+    if (mode === "vibe" || mode === "voice") {
       return;
     }
     const timer = setTimeout(() => {
@@ -311,6 +425,24 @@ ${snippet}`;
       analysisRunRef.current += 1;
     };
   }, [code, fileName, mode]);
+
+  useEffect(() => {
+    if (isListening) {
+      setVoiceTranscript(transcript);
+    }
+  }, [isListening, transcript]);
+
+  useEffect(() => {
+    if (!isListening && pendingTranscriptProcessRef.current && sessionActive && mode === "voice") {
+      pendingTranscriptProcessRef.current = false;
+      const textToProcess = transcript.trim() || voiceTranscript.trim();
+      if (textToProcess) {
+        void processRubberDuckyTranscript(textToProcess);
+      } else {
+        setRubberDuckyStatus("idle");
+      }
+    }
+  }, [isListening, sessionActive, mode, transcript, voiceTranscript, processRubberDuckyTranscript]);
 
   const runVibeTask = async (promptOverride?: string) => {
     if (!fileName || !code) {
@@ -334,14 +466,14 @@ ${snippet}`;
       }
       const model = import.meta.env.VITE_OPENAI_MODEL || "gpt-4o-mini";
       const prompt = `You are a coding agent inside an IDE.
-        Complete the user's request by editing only the active file.
-        Return only strict JSON with this shape:
-        {
+      Complete the user's request by editing only the active file.
+      Return only strict JSON with this shape:
+      {
         "summary": "short summary",
         "updatedContent": "full updated file content"
-        }
+      }
 
-        User request:
+      User request:
         ${taskPrompt}
 
         Active file:
@@ -406,7 +538,6 @@ ${snippet}`;
       setIsAnalyzing(false);
     }
   };
-
   const handleReviewerVibe = () => {
     const promptFromReviewer = lastGeminiResponse.replace(/```json\s*/g, "").replace(/```/g, "").trim() || explanation.replace(/```json\s*/g, "").replace(/```/g, "").replace(/<[^>]*>/g, "").trim();
     if (!promptFromReviewer) {
@@ -437,11 +568,11 @@ ${snippet}`;
             isDarkMode
               ? "bg-[#1f1f1f] border-[#414141] text-[#cccccc]"
               : "bg-[#ffffff] border-[#93c5fd] text-[#0f172a]"
-          }`}
-        >
+          }`}>
           <option value="teacher">Code Buddy</option>
           <option value="reviewer">Reviewer</option>
           <option value="vibe">Vibe Coder</option>
+          <option value="voice">Rubber Ducky</option>
         </select>
         <button
           type="button"
@@ -456,15 +587,107 @@ ${snippet}`;
             isDarkMode
               ? "border-[#414141] text-[#cccccc] hover:bg-[#303030]"
               : "border-[#93c5fd] text-[#0f172a] hover:bg-[#eff6ff]"
-          }`}
-        >
+          }`}>
           <Wand2 size={12} />
         </button>
         {isAnalyzing && <Loader2 size={14} className="ml-auto animate-spin text-blue-400" />}
       </div>
 
       <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
-        {mode === "vibe" ? (
+        {mode === "voice" ? (
+          <div className="space-y-4 flex flex-col h-full">
+            <div className="text-xs text-[#9da1a6] leading-relaxed">
+              Rubber duck debugging: speak your thoughts, the AI guides you with questions. Say &quot;stop&quot; or press Done to end.
+            </div>
+
+            {!speechSupported ? (
+              <div className="text-sm text-amber-400 border border-amber-600/50 rounded p-3 bg-amber-950/30">
+                Voice input is not supported in this browser. Try Chrome, Edge, or Safari.
+              </div>
+            ) : (
+              <>
+                {!sessionActive ? (
+                  <button
+                    type="button"
+                    onClick={startRubberDuckySession}
+                    className="flex items-center justify-center gap-2 w-full py-3 rounded font-medium bg-[#0e639c] hover:bg-[#1177bb] text-white transition-colors"
+                  >
+                    Start session
+                  </button>
+                ) : (
+                  <>
+                    <div className="flex-1 min-h-0 overflow-y-auto space-y-3 custom-scrollbar">
+                      {conversationHistory.map((msg, i) => (
+                        <div
+                          key={i}
+                          className={`rounded-lg p-2 text-sm ${
+                            msg.role === "user"
+                              ? "bg-blue-900/30 border border-blue-700/50 ml-4"
+                              : "bg-[#2d2d2d] border border-[#414141] mr-4"
+                          }`}
+                        >
+                          <span className="text-[#9da1a6] text-[10px] uppercase">
+                            {msg.role === "user" ? "You" : "Rubber duck"}
+                          </span>
+                          <p className="mt-0.5">{msg.content}</p>
+                        </div>
+                      ))}
+                    </div>
+
+                    {(rubberDuckyStatus === "listening" || rubberDuckyStatus === "processing" || rubberDuckyStatus === "speaking") && (
+                      <div className="text-xs text-[#9da1a6] flex items-center gap-2">
+                        {rubberDuckyStatus === "listening" && "Listening..."}
+                        {rubberDuckyStatus === "processing" && <><Loader2 size={12} className="animate-spin" /> Thinking...</>}
+                        {rubberDuckyStatus === "speaking" && "Speaking..."}
+                      </div>
+                    )}
+
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (isListening) {
+                            pendingTranscriptProcessRef.current = true;
+                            stop();
+                          } else {
+                            setRubberDuckyStatus("listening");
+                            start();
+                          }
+                        }}
+                        disabled={rubberDuckyStatus === "processing"}
+                        className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                          isListening
+                            ? "bg-red-600/80 hover:bg-red-600 text-white"
+                            : "bg-[#0e639c] hover:bg-[#1177bb] text-white"
+                        }`}
+                      >
+                        {isListening ? (
+                          <>
+                            <MicOff size={16} />
+                            Stop recording
+                          </>
+                        ) : (
+                          <>
+                            <Mic size={16} />
+                            {conversationHistory.length === 0 ? "Start recording" : "Speak again"}
+                          </>
+                        )}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={endRubberDuckySession}
+                        className="flex items-center justify-center gap-1.5 px-4 py-2.5 rounded font-medium border border-[#414141] text-[#cccccc] hover:bg-[#303030] transition-colors"
+                      >
+                        <Square size={14} />
+                        Done
+                      </button>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+          </div>
+        ) : mode === "vibe" ? (
           <div className="space-y-4">
             <div className="text-xs text-[#9da1a6] leading-relaxed">
               Write a task prompt. Vibe Coder edits only the active editor file.
@@ -478,8 +701,7 @@ ${snippet}`;
                 isDarkMode
                   ? "bg-[#1f1f1f] border-[#414141]"
                   : "bg-[#ffffff] border-[#93c5fd]"
-              }`}
-            />
+              }`}/>
 
             <div className={`text-xs rounded p-2 border ${isDarkMode ? "text-[#9da1a6] border-[#414141] bg-[#1f1f1f]" : "text-[#1d4ed8] border-[#bfdbfe] bg-[#f8fbff]"}`}>
               Active file: <span className="text-blue-300">{fileName || "None selected"}</span>
@@ -504,6 +726,7 @@ ${snippet}`;
               <div className={`h-4 rounded w-1/2 ${isDarkMode ? "bg-[#333]" : "bg-[#dbeafe]"}`}></div>
               <div className={`h-4 rounded w-full ${isDarkMode ? "bg-[#333]" : "bg-[#dbeafe]"}`}></div>
               <div className={`h-4 rounded w-5/6 ${isDarkMode ? "bg-[#333]" : "bg-[#dbeafe]"}`}></div>
+
            </div>
         ) : (
         <div className="space-y-4 text-sm leading-relaxed">
@@ -552,7 +775,6 @@ ${snippet}`;
               <span>AI analysis generated based on code patterns.</span>
             </div>
           )}
-
           {mode === "reviewer" && !isAnalyzing && lastGeminiResponse.trim().length > 0 && (
             <button
               type="button"
