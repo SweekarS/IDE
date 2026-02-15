@@ -78,15 +78,39 @@ interface CodeEditorProps {
   initialCode?: string;
   code?: string;
   onChange?: (code: string) => void;
+  onSelectionChange?: (selectedCode: string) => void;
   fileName?: string;
 }
 
-export function CodeEditor({ initialCode, code, onChange, fileName = "App.tsx" }: CodeEditorProps) {
+export function CodeEditor({
+  initialCode,
+  code,
+  onChange,
+  onSelectionChange,
+  fileName = "App.tsx",
+}: CodeEditorProps) {
   // If controlled, use props.code, else use local state initialized with initialCode
   const [internalCode, setInternalCode] = useState(initialCode || "");
+  const editorContainerRef = React.useRef<HTMLDivElement | null>(null);
 
   const isControlled = code !== undefined;
   const currentCode = isControlled ? code : internalCode;
+
+  const emitSelectionChange = () => {
+    if (!onSelectionChange) return;
+    const textarea = editorContainerRef.current?.querySelector("textarea");
+    if (!textarea) {
+      onSelectionChange("");
+      return;
+    }
+    const start = textarea.selectionStart ?? 0;
+    const end = textarea.selectionEnd ?? 0;
+    if (end <= start) {
+      onSelectionChange("");
+      return;
+    }
+    onSelectionChange(currentCode.slice(start, end));
+  };
 
   const handleChange = (newCode: string) => {
     if (!isControlled) {
@@ -95,6 +119,7 @@ export function CodeEditor({ initialCode, code, onChange, fileName = "App.tsx" }
     if (onChange) {
       onChange(newCode);
     }
+    window.requestAnimationFrame(emitSelectionChange);
   };
 
   // Reset internal state if initialCode changes (for uncontrolled usage when file switches)
@@ -120,7 +145,12 @@ export function CodeEditor({ initialCode, code, onChange, fileName = "App.tsx" }
       </div>
 
       {/* Editor Area */}
-      <div className="flex-1 relative overflow-auto custom-scrollbar">
+      <div
+        ref={editorContainerRef}
+        className="flex-1 relative overflow-auto custom-scrollbar"
+        onMouseUp={emitSelectionChange}
+        onKeyUp={emitSelectionChange}
+      >
         <style>{customPrismStyles}</style>
         <Editor
           value={currentCode}

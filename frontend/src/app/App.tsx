@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Panel, PanelGroup, PanelResizeHandle } from "react-resizable-panels";
 import { ActivityBar } from "./components/ActivityBar";
 import { Sidebar } from "./components/Sidebar";
@@ -11,6 +11,38 @@ import { FileNode } from "./components/Sidebar";
 
 // Helper to generate unique IDs
 const generateId = () => Math.random().toString(36).substr(2, 9);
+const AI_REFRESH_LINE_THRESHOLD = 5;
+
+const countChangedLines = (before: string, after: string): number => {
+  if (before === after) return 0;
+
+  const beforeLines = before.split("\n");
+  const afterLines = after.split("\n");
+
+  let start = 0;
+  while (
+    start < beforeLines.length &&
+    start < afterLines.length &&
+    beforeLines[start] === afterLines[start]
+  ) {
+    start += 1;
+  }
+
+  let beforeEnd = beforeLines.length - 1;
+  let afterEnd = afterLines.length - 1;
+  while (
+    beforeEnd >= start &&
+    afterEnd >= start &&
+    beforeLines[beforeEnd] === afterLines[afterEnd]
+  ) {
+    beforeEnd -= 1;
+    afterEnd -= 1;
+  }
+
+  const removedLines = Math.max(0, beforeEnd - start + 1);
+  const addedLines = Math.max(0, afterEnd - start + 1);
+  return Math.max(removedLines, addedLines);
+};
 
 export default function App() {
   const [activeActivity, setActiveActivity] = useState("explorer");
@@ -72,6 +104,24 @@ export default function App() {
 
   const [filesTree, setFilesTree] = useState<FileNode[]>(initialFilesTree);
   const [filesContent, setFilesContent] = useState(initialFilesContent);
+  const [aiPanelCode, setAiPanelCode] = useState(initialFilesContent[currentFile] || "");
+  const [selectedCode, setSelectedCode] = useState("");
+  const [terminalCommand, setTerminalCommand] = useState("python");
+  const [terminalLines, setTerminalLines] = useState<string[]>([
+    "Terminal ready.",
+    "Type a command below, then use Run menu.",
+  ]);
+  const pendingAiLineChangesRef = useRef<Record<string, number>>({});
+  const previousAiFileRef = useRef(currentFile);
+
+  useEffect(() => {
+    if (previousAiFileRef.current !== currentFile) {
+      setAiPanelCode(filesContent[currentFile] || "");
+      setSelectedCode("");
+      pendingAiLineChangesRef.current[currentFile] = 0;
+      previousAiFileRef.current = currentFile;
+    }
+  }, [currentFile, filesContent]);
 
   // --- File System Operations ---
 
@@ -159,6 +209,115 @@ export default function App() {
   };
 
   // --- Menu Actions ---
+
+  const appendTerminalLines = (lines: string[]) => {
+    setTerminalLines((prev) => [...prev, ...lines]);
+  };
+
+  const extractPrintOutputs = (source: string) => {
+    const outputs: string[] = [];
+    const printRegex = /print\(\s*(['"`])([\s\S]*?)\1\s*\)/g;
+    let match: RegExpExecArray | null = null;
+    while ((match = printRegex.exec(source)) !== null) {
+      outputs.push(match[2]);
+    }
+    return outputs;
+  };
+
+  const resolvePythonFileFromCommand = (commandArgs: string): string | null => {
+    const match = commandArgs.match(/["']([^"']+\.py)["']|(\S+\.py)/i);
+    if (!match) return null;
+    return (match[1] || match[2] || "").trim();
+  };
+
+  const runPythonSource = (source: string, label: string) => {
+    appendTerminalLines([`[Info] Executing ${label}`]);
+    const printOutputs = extractPrintOutputs(source);
+    if (printOutputs.length > 0) {
+      appendTerminalLines(printOutputs);
+    } else {
+      appendTerminalLines(["(no stdout)"]);
+    }
+    appendTerminalLines(["[Exit] code 0"]);
+  };
+
+  const executeTerminalCommand = (rawCommand: string) => {
+    const command = rawCommand.trim();
+    if (!command) return;
+
+    setVisiblePanels((p) => ({ ...p, terminal: true }));
+
+    if (/^(clear|cls)$/i.test(command)) {
+      setTerminalLines([]);
+      setTerminalCommand("");
+      return;
+    }
+
+    appendTerminalLines([`> ${command}`]);
+
+    if (/^help$/i.test(command)) {
+      appendTerminalLines([
+        "Supported commands:",
+        "python",
+        "python <file.py>",
+        "python -c \"print('hello')\"",
+        "clear",
+      ]);
+      setTerminalCommand("");
+      return;
+    }
+
+    const pythonMatch = command.match(/^python(?:\s+(.*))?$/i);
+    if (!pythonMatch) {
+      appendTerminalLines([`[Error] Unsupported command: ${command}`]);
+      setTerminalCommand("");
+      return;
+    }
+
+    const args = (pythonMatch[1] || "").trim();
+    if (!args) {
+      if (!currentFile.toLowerCase().endsWith(".py")) {
+        appendTerminalLines([`[Error] Active file is not Python: ${currentFile}`]);
+      } else {
+        runPythonSource(filesContent[currentFile] || "", currentFile);
+      }
+      setTerminalCommand("");
+      return;
+    }
+
+    const inlineMatch = args.match(/^-c\s+["']([\s\S]*)["']$/);
+    if (inlineMatch) {
+      runPythonSource(inlineMatch[1], "inline Python (-c)");
+      setTerminalCommand("");
+      return;
+    }
+
+    const targetFile = resolvePythonFileFromCommand(args);
+    if (!targetFile) {
+      appendTerminalLines([`[Error] Could not resolve Python file from command: ${command}`]);
+      setTerminalCommand("");
+      return;
+    }
+
+    const targetContent = filesContent[targetFile];
+    if (typeof targetContent !== "string") {
+      appendTerminalLines([`[Error] File not found in workspace: ${targetFile}`]);
+      setTerminalCommand("");
+      return;
+    }
+
+    runPythonSource(targetContent, targetFile);
+    setTerminalCommand("");
+  };
+
+  const runCurrentPythonFile = (mode: "debug" | "run") => {
+    const trimmedCommand = terminalCommand.trim() || "python";
+    const fileCommand = trimmedCommand.includes("{file}")
+      ? trimmedCommand.replace("{file}", currentFile)
+      : `${trimmedCommand} ${currentFile}`;
+    appendTerminalLines([`${mode === "debug" ? "[Debug]" : "[Run]"} ${fileCommand}`]);
+    executeTerminalCommand(fileCommand);
+  };
 
   const handleMenuAction = (action: string, payload?: any) => {
     const findFirstFileName = (nodes: FileNode[]): string | null => {
@@ -267,6 +426,12 @@ export default function App() {
         case "toggle_word_wrap":
              alert("Word wrap toggled (simulated)");
              break;
+        case "start_debugging":
+            runCurrentPythonFile("debug");
+            break;
+        case "run_without_debugging":
+            runCurrentPythonFile("run");
+            break;
         default:
             console.log("Action:", action);
     }
@@ -275,6 +440,20 @@ export default function App() {
   // ---
 
   const handleCodeChange = (newCode: string) => {
+    const previousCode = filesContent[currentFile] || "";
+    const changedLines = countChangedLines(previousCode, newCode);
+
+    if (changedLines > 0) {
+      const pending = pendingAiLineChangesRef.current[currentFile] || 0;
+      const nextPending = pending + changedLines;
+      pendingAiLineChangesRef.current[currentFile] = nextPending;
+
+      if (nextPending >= AI_REFRESH_LINE_THRESHOLD) {
+        setAiPanelCode(newCode);
+        pendingAiLineChangesRef.current[currentFile] = 0;
+      }
+    }
+
     setFilesContent((prev) => ({
       ...prev,
       [currentFile]: newCode,
@@ -368,6 +547,7 @@ export default function App() {
                         fileName={currentFile} 
                         code={currentCode}
                         onChange={handleCodeChange}
+                        onSelectionChange={setSelectedCode}
                     />
                 ) : (
                     <div className="h-full flex items-center justify-center text-gray-500">
@@ -383,7 +563,12 @@ export default function App() {
                   <>
                     <PanelResizeHandle className="h-[1px] bg-[#414141] hover:bg-blue-500 transition-colors" />
                     <Panel defaultSize={30} minSize={10} className="bg-[#1e1e1e]">
-                        <BottomPanel />
+                        <BottomPanel
+                          terminalCommand={terminalCommand}
+                          terminalLines={terminalLines}
+                          onTerminalCommandChange={setTerminalCommand}
+                          onTerminalCommandRun={executeTerminalCommand}
+                        />
                     </Panel>
                   </>
               )}
@@ -395,11 +580,7 @@ export default function App() {
             <>
                 <PanelResizeHandle className="w-[1px] bg-[#414141] hover:bg-blue-500 transition-colors" />
                 <Panel defaultSize={25} minSize={15} maxSize={40} className="bg-[#1e1e1e]">
-                    <AIPanel
-                      code={currentCode}
-                      fileName={currentFile}
-                      onApplyActiveFileChange={handleApplyAIChangeToActiveFile}
-                    />
+                    <AIPanel code={aiPanelCode} fileName={currentFile} selectedCode={selectedCode} onApplyActiveFileChange={handleApplyAIChangeToActiveFile}/>
                 </Panel>
             </>
           )}
