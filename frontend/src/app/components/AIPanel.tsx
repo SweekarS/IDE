@@ -286,7 +286,8 @@ ${batchSource}`;
     setIsAnalyzing(true);
     setExplanation("Analyzing selected code in Code Buddy mode...");
     setLastGeminiResponse("");
-    const genAI = new GoogleGenerativeAI("AIzaSyBLzpDN_C2TsvX70n22V8eqfpLEBXRqZ7Q");
+    const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+    const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
     const extractedFunctions = extractPythonFunctions(snippet);
